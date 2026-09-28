@@ -12,7 +12,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Build, publish, and verify immutable grammar release
         env:
@@ -24,20 +24,46 @@ jobs:
 
           readonly repository="zhuxi-czx/pxinput-assets"
           readonly release_tag="offline-grammar-v1"
+          readonly staging_tag="$release_tag-draft-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           readonly model_filename="wanxiang-lts-zh-hans.gram"
           readonly model_size="420340780"
           readonly model_sha256="b91d525f118b24871cfc82b47b32921cdbc92a43cea42419a88afe4f780b278c"
           readonly model_source_url="https://github.com/OrdChaos/RIME-LMDG.snapshot/releases/download/20260910202212/wanxiang-lts-zh-hans.gram"
           readonly public_key_source="Resources/OfflineGrammarRelease/public-key.base64"
+          readonly release_marker="pxinput-offline-grammar-workflow:$staging_tag:$GITHUB_SHA"
 
           temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/pxinput-offline-grammar-publish.XXXXXX")"
           printf 'OFFLINE_GRAMMAR_TEMPORARY_DIRECTORY=%s\n' "$temporary_directory" >> "$GITHUB_ENV"
           cleanup() {
+            status=$?
+            trap - EXIT
             if [[ "$temporary_directory" == "${TMPDIR:-/tmp}"/pxinput-offline-grammar-publish.* ]]; then
               rm -rf -- "$temporary_directory"
             fi
+            exit "$status"
           }
           trap cleanup EXIT
+
+          check_final_destination_available() {
+            local release_probe release_probe_error
+            release_probe_error="$temporary_directory/release-probe-error"
+            if release_probe="$(gh api --include "repos/$repository/releases/tags/$release_tag" 2> "$release_probe_error")"; then
+              echo "refusing to replace published release: $release_tag" >&2
+              exit 1
+            fi
+            [[ "$release_probe" =~ ^HTTP/[0-9.]+[[:space:]]404([[:space:]]|$) ]] || {
+              cat "$release_probe_error" >&2
+              echo "could not prove release destination is unused: $release_tag" >&2
+              exit 1
+            }
+            remote_tag_target="$(git ls-remote --tags "https://github.com/$repository.git" \
+              "refs/tags/$release_tag" "refs/tags/$release_tag^{}" | \
+              awk -v tag="refs/tags/$release_tag" '$2 == tag || $2 == tag "^{}" { target = $1 } END { print target }')"
+            [[ -z "$remote_tag_target" || "$remote_tag_target" == "$GITHUB_SHA" ]] || {
+              echo "refusing tag at unexpected commit: $release_tag" >&2
+              exit 1
+            }
+          }
 
           private_key_file="$temporary_directory/private-key-base64"
           configured_public_key_file="$temporary_directory/configured-public-key-base64"
@@ -73,31 +99,60 @@ jobs:
             }
           }
 
-          release_probe="$temporary_directory/release-probe"
-          if gh api --include --silent "repos/$repository/releases/tags/$release_tag" > "$release_probe"; then
-            echo "refusing to replace existing release: $release_tag" >&2
-            exit 1
-          else
-            release_status=$?
-            if [[ "$release_status" -ne 1 ]] || ! grep -Eq '^HTTP/[0-9.]+ 404' "$release_probe"; then
-              echo "unable to determine whether release exists: $release_tag" >&2
-              exit 1
+          reserve_final_tag() {
+            remote_tag_target="$(git ls-remote --tags "https://github.com/$repository.git" \
+              "refs/tags/$release_tag" "refs/tags/$release_tag^{}" | \
+              awk -v tag="refs/tags/$release_tag" '$2 == tag || $2 == tag "^{}" { target = $1 } END { print target }')"
+            if [[ -z "$remote_tag_target" ]]; then
+              if ! gh api --method POST "repos/$repository/git/refs" \
+                -f "ref=refs/tags/$release_tag" -f "sha=$GITHUB_SHA" >/dev/null; then
+                verify_reserved_tag
+                return
+              fi
             fi
-          fi
-          if git ls-remote --exit-code --refs "https://github.com/$repository.git" "refs/tags/$release_tag" >/dev/null 2>&1; then
-            echo "refusing to replace existing tag: $release_tag" >&2
-            exit 1
-          else
-            tag_status=$?
-            [[ "$tag_status" == 2 ]] || {
-              echo "unable to determine whether tag exists: $release_tag" >&2
-              exit 1
-            }
-          fi
+            verify_reserved_tag
+          }
+
+          authenticate_draft_assets() {
+            local draft_release_id="$1"
+            local asset_name asset_id
+            draft_inventory="$(gh api "repos/$repository/releases/$draft_release_id" \
+              --jq '.assets | map(.name) | sort | join(" ")')"
+            [[ "$draft_inventory" == "${expected_inventory[*]}" ]]
+            mkdir -p "$draft_directory"
+            for asset_name in "${expected_inventory[@]}"; do
+              asset_id="$(gh api "repos/$repository/releases/$draft_release_id" \
+                --jq ".assets[] | select(.name == \"$asset_name\") | .id")"
+              [[ -n "$asset_id" ]]
+              gh api -H 'Accept: application/octet-stream' \
+                "repos/$repository/releases/assets/$asset_id" > "$draft_directory/$asset_name"
+            done
+            cmp "$release_directory/manifest.json" "$draft_directory/manifest.json"
+            cmp "$release_directory/manifest.sig" "$draft_directory/manifest.sig"
+            cmp "$release_directory/$model_filename" "$draft_directory/$model_filename"
+            swift Scripts/offline_grammar_crypto.swift verify \
+              --public-key-file "$configured_public_key_file" \
+              --input "$draft_directory/manifest.json" \
+              --signature "$draft_directory/manifest.sig"
+          }
+
+          upload_draft_assets() {
+            local asset_name
+            for asset_name in "${expected_inventory[@]}"; do
+              gh api --method POST --hostname uploads.github.com \
+                -H 'Content-Type: application/octet-stream' \
+                "repos/$repository/releases/$release_id/assets?name=$asset_name" \
+                --input "$release_directory/$asset_name" >/dev/null
+            done
+          }
+
+          check_final_destination_available
 
           model="$temporary_directory/$model_filename"
           release_directory="$temporary_directory/release"
+          draft_directory="$temporary_directory/draft"
           public_directory="$temporary_directory/public"
+          release_notes_file="$temporary_directory/release-notes.md"
 
           curl --fail --location --show-error --silent --output "$model" "$model_source_url"
           [[ "$(stat -f %z "$model")" == "$model_size" ]]
@@ -116,23 +171,33 @@ jobs:
           actual_inventory=($(find "$release_directory" -maxdepth 1 -type f -print | sed 's|.*/||' | LC_ALL=C sort))
           [[ "${actual_inventory[*]}" == "${expected_inventory[*]}" ]]
 
-          gh api --method POST "repos/$repository/git/refs" \
-            -f "ref=refs/tags/$release_tag" -f "sha=$GITHUB_SHA" >/dev/null
+          cat README.md > "$release_notes_file"
+          printf '\n<!-- %s -->\n' "$release_marker" >> "$release_notes_file"
+          release_id="$(gh api --method POST "repos/$repository/releases" \
+            -f "tag_name=$staging_tag" \
+            -f "target_commitish=$GITHUB_SHA" \
+            -f "name=$staging_tag" \
+            -F "draft=true" \
+            -f "body=$(< "$release_notes_file")" \
+            --jq '.id')"
+          [[ -n "$release_id" ]]
+          upload_draft_assets
+          authenticate_draft_assets "$release_id"
+          check_final_destination_available
+          reserve_final_tag
+          publish_result="$(gh api --method PATCH "repos/$repository/releases/$release_id" \
+            -f "tag_name=$release_tag" \
+            -f "target_commitish=$GITHUB_SHA" \
+            -f "name=$release_tag" \
+            -F "draft=false" --jq '.draft')"
+          [[ "$publish_result" == false ]]
           verify_reserved_tag
-          gh release create "$release_tag" --repo "$repository" --verify-tag \
-            --title "$release_tag" --notes-file README.md \
-            "$release_directory/manifest.json" \
-            "$release_directory/manifest.sig" \
-            "$release_directory/$model_filename"
-
-          released_assets="$(gh release view "$release_tag" --repo "$repository" --json assets --jq '.assets | map(.name) | sort | join(" ")')"
-          [[ "$released_assets" == "${expected_inventory[*]}" ]]
 
           public_release_url="https://github.com/$repository/releases/download/$release_tag"
           mkdir "$public_directory"
-          curl --fail --location --show-error --silent --output "$public_directory/manifest.json" "$public_release_url/manifest.json"
-          curl --fail --location --show-error --silent --output "$public_directory/manifest.sig" "$public_release_url/manifest.sig"
-          curl --fail --location --show-error --silent --output "$public_directory/$model_filename" "$public_release_url/$model_filename"
+          env -u GH_TOKEN -u GITHUB_TOKEN curl --fail --location --show-error --silent --output "$public_directory/manifest.json" "$public_release_url/manifest.json"
+          env -u GH_TOKEN -u GITHUB_TOKEN curl --fail --location --show-error --silent --output "$public_directory/manifest.sig" "$public_release_url/manifest.sig"
+          env -u GH_TOKEN -u GITHUB_TOKEN curl --fail --location --show-error --silent --output "$public_directory/$model_filename" "$public_release_url/$model_filename"
           [[ "$(stat -f %z "$public_directory/$model_filename")" == "$model_size" ]]
           [[ "$(shasum -a 256 "$public_directory/$model_filename" | awk '{print $1}')" == "$model_sha256" ]]
           [[ "$(stat -f %z "$public_directory/manifest.sig")" == 64 ]]
