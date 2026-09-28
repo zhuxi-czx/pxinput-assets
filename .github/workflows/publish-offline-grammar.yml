@@ -1,0 +1,155 @@
+name: Publish offline grammar
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: macos-14
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build, publish, and verify immutable grammar release
+        env:
+          PX_OFFLINE_GRAMMAR_ED25519_PRIVATE_KEY_BASE64: ${{ secrets.PX_OFFLINE_GRAMMAR_ED25519_PRIVATE_KEY_BASE64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+
+          readonly repository="zhuxi-czx/pxinput-assets"
+          readonly release_tag="offline-grammar-v1"
+          readonly model_filename="wanxiang-lts-zh-hans.gram"
+          readonly model_size="420340780"
+          readonly model_sha256="b91d525f118b24871cfc82b47b32921cdbc92a43cea42419a88afe4f780b278c"
+          readonly model_source_url="https://github.com/OrdChaos/RIME-LMDG.snapshot/releases/download/20260910202212/wanxiang-lts-zh-hans.gram"
+          readonly public_key_source="Resources/OfflineGrammarRelease/public-key.base64"
+
+          temporary_directory="$(mktemp -d "${TMPDIR:-/tmp}/pxinput-offline-grammar-publish.XXXXXX")"
+          printf 'OFFLINE_GRAMMAR_TEMPORARY_DIRECTORY=%s\n' "$temporary_directory" >> "$GITHUB_ENV"
+          cleanup() {
+            if [[ "$temporary_directory" == "${TMPDIR:-/tmp}"/pxinput-offline-grammar-publish.* ]]; then
+              rm -rf -- "$temporary_directory"
+            fi
+          }
+          trap cleanup EXIT
+
+          private_key_file="$temporary_directory/private-key-base64"
+          configured_public_key_file="$temporary_directory/configured-public-key-base64"
+          derived_public_key_file="$temporary_directory/derived-public-key-base64"
+          [[ -f "$public_key_source" ]] || {
+            echo "missing committed offline grammar signing-key configuration" >&2
+            exit 1
+          }
+          configured_public_key="$(cat "$public_key_source")"
+          [[ "$configured_public_key" =~ ^[A-Za-z0-9+/]{43}=$ ]] || {
+            echo "configured offline grammar public key is invalid" >&2
+            exit 1
+          }
+          printf '%s' "$configured_public_key" > "$configured_public_key_file"
+          chmod 600 "$configured_public_key_file"
+          [[ "$(base64 -D < "$configured_public_key_file" | wc -c | tr -d ' ')" == 32 ]] || {
+            echo "configured offline grammar public key must decode to 32 bytes" >&2
+            exit 1
+          }
+          printf '%s' "$PX_OFFLINE_GRAMMAR_ED25519_PRIVATE_KEY_BASE64" > "$private_key_file"
+          chmod 600 "$private_key_file"
+          swift Scripts/offline_grammar_crypto.swift public-key \
+            --private-key-file "$private_key_file" --public-key-output "$derived_public_key_file"
+          cmp "$configured_public_key_file" "$derived_public_key_file"
+
+          verify_reserved_tag() {
+            remote_tag_target="$(git ls-remote --tags "https://github.com/$repository.git" \
+              "refs/tags/$release_tag" "refs/tags/$release_tag^{}" | \
+              awk -v tag="refs/tags/$release_tag" '$2 == tag || $2 == tag "^{}" { target = $1 } END { print target }')"
+            [[ "$remote_tag_target" == "$GITHUB_SHA" ]] || {
+              echo "reserved tag does not resolve to the checked-out commit" >&2
+              exit 1
+            }
+          }
+
+          release_probe="$temporary_directory/release-probe"
+          if gh api --include --silent "repos/$repository/releases/tags/$release_tag" > "$release_probe"; then
+            echo "refusing to replace existing release: $release_tag" >&2
+            exit 1
+          else
+            release_status=$?
+            if [[ "$release_status" -ne 1 ]] || ! grep -Eq '^HTTP/[0-9.]+ 404' "$release_probe"; then
+              echo "unable to determine whether release exists: $release_tag" >&2
+              exit 1
+            fi
+          fi
+          if git ls-remote --exit-code --refs "https://github.com/$repository.git" "refs/tags/$release_tag" >/dev/null 2>&1; then
+            echo "refusing to replace existing tag: $release_tag" >&2
+            exit 1
+          else
+            tag_status=$?
+            [[ "$tag_status" == 2 ]] || {
+              echo "unable to determine whether tag exists: $release_tag" >&2
+              exit 1
+            }
+          fi
+
+          model="$temporary_directory/$model_filename"
+          release_directory="$temporary_directory/release"
+          public_directory="$temporary_directory/public"
+
+          curl --fail --location --show-error --silent --output "$model" "$model_source_url"
+          [[ "$(stat -f %z "$model")" == "$model_size" ]]
+          [[ "$(shasum -a 256 "$model" | awk '{print $1}')" == "$model_sha256" ]]
+
+          python3 Scripts/build_offline_grammar_release.py \
+            --model "$model" \
+            --output "$release_directory" \
+            --repository "$repository" \
+            --tag "$release_tag" \
+            --private-key "$private_key_file" \
+            --minimum-app-version 0.3.101 \
+            --maximum-app-version 0.3.999
+
+          expected_inventory=(manifest.json manifest.sig "$model_filename")
+          actual_inventory=($(find "$release_directory" -maxdepth 1 -type f -print | sed 's|.*/||' | LC_ALL=C sort))
+          [[ "${actual_inventory[*]}" == "${expected_inventory[*]}" ]]
+
+          gh api --method POST "repos/$repository/git/refs" \
+            -f "ref=refs/tags/$release_tag" -f "sha=$GITHUB_SHA" >/dev/null
+          verify_reserved_tag
+          gh release create "$release_tag" --repo "$repository" --verify-tag \
+            --title "$release_tag" --notes-file README.md \
+            "$release_directory/manifest.json" \
+            "$release_directory/manifest.sig" \
+            "$release_directory/$model_filename"
+
+          released_assets="$(gh release view "$release_tag" --repo "$repository" --json assets --jq '.assets | map(.name) | sort | join(" ")')"
+          [[ "$released_assets" == "${expected_inventory[*]}" ]]
+
+          public_release_url="https://github.com/$repository/releases/download/$release_tag"
+          mkdir "$public_directory"
+          curl --fail --location --show-error --silent --output "$public_directory/manifest.json" "$public_release_url/manifest.json"
+          curl --fail --location --show-error --silent --output "$public_directory/manifest.sig" "$public_release_url/manifest.sig"
+          curl --fail --location --show-error --silent --output "$public_directory/$model_filename" "$public_release_url/$model_filename"
+          [[ "$(stat -f %z "$public_directory/$model_filename")" == "$model_size" ]]
+          [[ "$(shasum -a 256 "$public_directory/$model_filename" | awk '{print $1}')" == "$model_sha256" ]]
+          [[ "$(stat -f %z "$public_directory/manifest.sig")" == 64 ]]
+          cmp "$release_directory/manifest.json" "$public_directory/manifest.json"
+          cmp "$release_directory/manifest.sig" "$public_directory/manifest.sig"
+          swift Scripts/offline_grammar_crypto.swift verify \
+            --public-key-file "$configured_public_key_file" \
+            --input "$public_directory/manifest.json" \
+            --signature "$public_directory/manifest.sig"
+          verify_reserved_tag
+
+      - name: Remove temporary signing material
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          temporary_directory="${OFFLINE_GRAMMAR_TEMPORARY_DIRECTORY:-}"
+          if [[ "$temporary_directory" == "${TMPDIR:-/tmp}"/pxinput-offline-grammar-publish.* ]]; then
+            rm -rf -- "$temporary_directory"
+          fi
